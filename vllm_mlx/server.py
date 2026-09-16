@@ -1685,7 +1685,12 @@ async def lifespan(app: FastAPI):
             and _engine is not None
             and hasattr(_engine, "load_cache_from_disk")
         ):
-            _load_prefix_cache_from_disk()
+            # Route through asyncio.to_thread: _load_prefix_cache_from_disk calls
+            # engine.load_cache_from_disk which internally dispatches through
+            # MLXExecutor.run() to the MLX owner thread. Without to_thread the
+            # blocking executor.run() would block the asyncio Event Loop.
+            await asyncio.to_thread(_load_prefix_cache_from_disk)
+
 
         # Warm up prefix cache with user-provided prompts (AFTER disk cache load,
         # so any already-persisted entries are preserved and warm-up only fills
@@ -1741,7 +1746,10 @@ async def lifespan(app: FastAPI):
             and _engine is not None
             and hasattr(_engine, "save_cache_to_disk")
         ):
-            _save_prefix_cache_to_disk()
+            # Route through asyncio.to_thread: save_cache_to_disk dispatches
+            # through MLXExecutor.run() which would otherwise block the Event Loop.
+            await asyncio.to_thread(_save_prefix_cache_to_disk)
+
 
         # Shutdown: Close MCP connections and stop engine
         if _lifecycle_task is not None:
@@ -3978,10 +3986,13 @@ async def clear_cache():
     cleared_engine = None
     if _engine is not None and hasattr(_engine, "clear_runtime_caches"):
         try:
-            cleared_engine = _engine.clear_runtime_caches()
+            # clear_runtime_caches routes through MLXExecutor.run() internally,
+            # so we must not call it directly on the Event Loop (it blocks).
+            cleared_engine = await asyncio.to_thread(_engine.clear_runtime_caches)
         except Exception as exc:
             logger.warning("Failed to clear engine caches: %s", exc, exc_info=True)
             cleared_engine = {"error": str(exc)}
+
 
     try:
         from mlx_vlm.utils import (
@@ -4018,13 +4029,15 @@ async def clear_prefix_cache():
     cleared = False
     if hasattr(_engine, "clear_prefix_cache"):
         try:
-            _engine.clear_prefix_cache()
+            # clear_prefix_cache routes through MLXExecutor.run() internally.
+            await asyncio.to_thread(_engine.clear_prefix_cache)
             cleared = True
         except Exception as e:
             logger.warning(
                 "[clear_prefix_cache] engine.clear_prefix_cache failed: %s",
                 _sanitize_log_text(e, limit=500),
             )
+
 
     # Auto re-warm in background if warm-prompts was configured.
     rewarm_scheduled = False
