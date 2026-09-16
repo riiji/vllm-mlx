@@ -210,6 +210,8 @@ class EngineCore:
         worker = external_worker or ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="engine-core"
         )
+        if owns_worker:
+            self._external_generation_worker = worker
         worker_stream_bound = False
         model_thread_stream_bound = False
         use_worker_thread = True
@@ -412,6 +414,7 @@ class EngineCore:
                     # one owns the loaded model and outlives the engine loop.
                     if owns_worker:
                         worker.shutdown(wait=True)
+                        self._external_generation_worker = None
 
     async def add_request(
         self,
@@ -458,8 +461,13 @@ class EngineCore:
         )
         self._finished_events[request_id] = asyncio.Event()
 
-        # Add to scheduler
-        self.scheduler.add_request(request)
+        # Add to scheduler on the worker thread that owns the model and streams
+        worker = getattr(self, "_external_generation_worker", None)
+        if worker is not None:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(worker, self.scheduler.add_request, request)
+        else:
+            self.scheduler.add_request(request)
         _set_request_event(getattr(self, "_request_event", None))
 
         return request_id
