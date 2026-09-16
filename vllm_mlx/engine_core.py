@@ -297,6 +297,8 @@ class EngineCore:
         def _close_batch_generator() -> None:
             self.scheduler._close_batch_generator()
 
+        stream_thread_fallback_used = False
+
         try:
             while self._running:
                 try:
@@ -306,10 +308,26 @@ class EngineCore:
                             output = await executor.arun(_do_step)
                         except Exception as e:
                             if _is_stream_thread_error(e):
-                                # Stream/thread mismatch: recover on owner thread
-                                # (rebind streams + reschedule). Never fall back
-                                # to the event loop — that causes catastrophic
-                                # throughput collapse.
+                                if getattr(executor, "_owns_worker", False) and not stream_thread_fallback_used:
+                                    # Standalone EngineCore case (e.g. unit tests or direct library use)
+                                    # where the model was loaded by the caller on their current thread
+                                    # without passing an MLXExecutor. The worker thread cannot step this
+                                    # model, so switch to inline stepping on the caller's thread.
+                                    # BatchedEngine / server passes an executor (owns_worker=False),
+                                    # so the production server NEVER falls back to the event loop.
+                                    stream_thread_fallback_used = True
+                                    logger.warning(
+                                        "Detected MLX stream/thread mismatch on worker step; "
+                                        "switching standalone engine to model-thread stepping"
+                                    )
+                                    await executor.arun(self.scheduler._close_batch_generator)
+                                    executor._inline = True
+                                    executor._streams_bound = False
+                                    executor.bind_streams(bind_fn=bind_generation_streams)
+                                    self.scheduler._recover_from_cache_error()
+                                    self.scheduler._reschedule_running_requests()
+                                    continue
+
                                 logger.warning(
                                     "MLX stream/thread mismatch detected; "
                                     "recovering on owner thread and rescheduling"
@@ -319,6 +337,7 @@ class EngineCore:
                             raise
                         # Yield to event loop after each step.
                         await asyncio.sleep(0)
+
 
                         # Watchdog: track consecutive empty steps while running.
                         outputs = output.outputs
