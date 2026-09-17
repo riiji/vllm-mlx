@@ -264,8 +264,3 @@ class Qwen2Model(nn.Module):
             get_model_classes=lambda *args, **kwargs: (cls, ModelArgs),
         )
         return model
-
-
-# Backwards-compatibility alias
-NativeQwen2ForCausalLM = Qwen2Model
-Model = Qwen2Model
