@@ -2,15 +2,15 @@
 """
 Native model implementations for vllm-mlx.
 
-These models implement fused kernel operations (such as fused QKV and fused Gate-Up projections)
-natively without runtime monkey-patching, maximizing inference efficiency on Apple Silicon.
+Optimized models implementing fused projections (such as fused QKV and Gate-Up)
+for improved inference efficiency on Apple Silicon.
 """
 
 from typing import Any
 
 _NATIVE_MODEL_REGISTRY: dict[str, tuple[str, str, str]] = {
-    "qwen2": ("vllm_mlx.models.native.qwen2", "NativeQwen2ForCausalLM", "ModelArgs"),
-    "qwen2.5": ("vllm_mlx.models.native.qwen2", "NativeQwen2ForCausalLM", "ModelArgs"),
+    "qwen2": ("vllm_mlx.native_models.qwen2", "Qwen2Model", "ModelArgs"),
+    "qwen2.5": ("vllm_mlx.native_models.qwen2", "Qwen2Model", "ModelArgs"),
 }
 
 

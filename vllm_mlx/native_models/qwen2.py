@@ -1,12 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-Native Qwen2 / Qwen2.5 implementation with fused QKV and Gate-Up projections.
+Qwen2 / Qwen2.5 implementation with fused QKV and Gate-Up projections.
 
-This module provides an optimized implementation of the Qwen2 / Qwen2.5 architecture
-using standard Apple MLX primitives. Projections for Query, Key, and Value are fused into
-a single matrix multiplication, and Gate and Up projections in the MLP are fused into
-a single matrix multiplication, eliminating redundant Metal kernel dispatches without
-runtime monkey-patching.
+Projections for Query, Key, and Value are fused into a single matrix multiplication,
+and Gate and Up projections in the MLP are fused into a single matrix multiplication,
+reducing kernel dispatches during inference.
 """
 
 from dataclasses import dataclass
@@ -174,10 +172,10 @@ class FusedQwen2Model(nn.Module):
         return self.norm(h)
 
 
-class NativeQwen2ForCausalLM(nn.Module):
+class Qwen2Model(nn.Module):
     """
-    Native Qwen2 causal language model with fused QKV and Gate-Up projections.
-    Fully compatible with mlx_lm.generate.BatchGenerator, KVCache, and SimpleEngine.
+    Qwen2 causal language model with fused QKV and Gate-Up projections.
+    Compatible with mlx_lm generation, KVCache, and engine batch generators.
     """
 
     def __init__(self, args: ModelArgs):
@@ -190,7 +188,7 @@ class NativeQwen2ForCausalLM(nn.Module):
 
     @property
     def layers(self):
-        """Expose layers property for BatchGenerator and cache construction."""
+        """Expose layers property for cache construction and batch generators."""
         return self.model.layers
 
     def __call__(
@@ -208,8 +206,8 @@ class NativeQwen2ForCausalLM(nn.Module):
 
     def sanitize(self, weights: dict[str, mx.array]) -> dict[str, mx.array]:
         """
-        Transform standard checkpoint weights into fused QKV and Gate-Up structures.
-        Supports both floating point and quantized (scales/biases) representations.
+        Transform checkpoint weights into fused QKV and Gate-Up representations.
+        Supports both floating-point and quantized (scales/biases) formats.
         """
         weights = UpstreamQwen2Model.sanitize(self, weights)
         num_layers = getattr(self.args, "num_hidden_layers", 0)
@@ -219,7 +217,7 @@ class NativeQwen2ForCausalLM(nn.Module):
     def _fuse_weights(
         cls, weights: dict[str, mx.array], num_layers: int
     ) -> dict[str, mx.array]:
-        """Fuse separate Q, K, V and Gate, Up weights (matching mlx-learn design)."""
+        """Fuse separate Q, K, V and Gate, Up projections into unified tensors."""
         for i in range(num_layers):
             p_attn = f"model.layers.{i}.self_attn"
             for suffix in ("weight", "bias", "scales", "biases"):
@@ -246,7 +244,7 @@ class NativeQwen2ForCausalLM(nn.Module):
     def sanitize_weights(
         cls, weights: dict[str, mx.array], num_layers: int = 1
     ) -> dict[str, mx.array]:
-        """Static transformation of checkpoint weights for testing and utilities."""
+        """Transform checkpoint weights for testing and offline conversion."""
         return cls._fuse_weights(weights, num_layers=num_layers)
 
     @classmethod
@@ -255,8 +253,8 @@ class NativeQwen2ForCausalLM(nn.Module):
         model_path: Union[str, Path],
         lazy: bool = False,
         strict: bool = True,
-    ) -> "NativeQwen2ForCausalLM":
-        """Load and initialize a NativeQwen2ForCausalLM model from a directory."""
+    ) -> "Qwen2Model":
+        """Load and initialize a model from a local directory or HF snapshot."""
         from mlx_lm.utils import load_model
 
         model, _ = load_model(
@@ -266,3 +264,8 @@ class NativeQwen2ForCausalLM(nn.Module):
             get_model_classes=lambda *args, **kwargs: (cls, ModelArgs),
         )
         return model
+
+
+# Backwards-compatibility alias
+NativeQwen2ForCausalLM = Qwen2Model
+Model = Qwen2Model

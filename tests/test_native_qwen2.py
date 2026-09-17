@@ -3,12 +3,12 @@ from pathlib import Path
 import mlx.core as mx
 import pytest
 
-from vllm_mlx.models.native import get_native_model_class, has_native_model
-from vllm_mlx.models.native.qwen2 import (
+from vllm_mlx.native_models import get_native_model_class, has_native_model
+from vllm_mlx.native_models.qwen2 import (
     FusedQwen2Attention,
     FusedQwen2MLP,
     ModelArgs,
-    NativeQwen2ForCausalLM,
+    Qwen2Model,
 )
 from vllm_mlx.utils.tokenizer import load_model_with_fallback
 
@@ -20,14 +20,14 @@ def test_native_model_registry():
     assert has_native_model("nonexistent_arch") is False
 
     model_cls, args_cls = get_native_model_class("qwen2")
-    assert model_cls is NativeQwen2ForCausalLM
+    assert model_cls is Qwen2Model
     assert args_cls is ModelArgs
 
     assert get_native_model_class("unknown") is None
 
 
 def test_fused_qwen2_synthetic_forward():
-    """Verify forward pass of NativeQwen2ForCausalLM with synthetic weights."""
+    """Verify forward pass of Qwen2Model with synthetic weights."""
     args = ModelArgs(
         model_type="qwen2",
         hidden_size=64,
@@ -38,7 +38,7 @@ def test_fused_qwen2_synthetic_forward():
         vocab_size=100,
         rms_norm_eps=1e-6,
     )
-    model = NativeQwen2ForCausalLM(args)
+    model = Qwen2Model(args)
 
     assert hasattr(model, "layers")
     assert len(model.layers) == 2
@@ -66,7 +66,7 @@ def test_fused_qwen2_sanitize_weights():
         "model.layers.0.mlp.up_proj.weight": up,
     }
 
-    sanitized = NativeQwen2ForCausalLM.sanitize_weights(raw_weights)
+    sanitized = Qwen2Model.sanitize_weights(raw_weights)
 
     assert "model.layers.0.self_attn.qkv_proj.weight" in sanitized
     assert "model.layers.0.mlp.gate_up_proj.weight" in sanitized
@@ -99,7 +99,7 @@ def test_fused_qwen2_sanitize_quantized_weights():
         "model.layers.0.self_attn.v_proj.scales": mx.full((32, 2), 3.0, dtype=mx.float16),
         "model.layers.0.self_attn.v_proj.biases": mx.zeros((32, 2), dtype=mx.float16),
     }
-    sanitized = NativeQwen2ForCausalLM.sanitize_weights(raw_weights)
+    sanitized = Qwen2Model.sanitize_weights(raw_weights)
 
     assert "model.layers.0.self_attn.qkv_proj.weight" in sanitized
     assert "model.layers.0.self_attn.qkv_proj.scales" in sanitized
@@ -128,8 +128,8 @@ def test_qwen2_numerical_parity():
         str(LOCAL_QWEN_PATH), enable_native_models=True
     )
 
-    assert isinstance(native_model, NativeQwen2ForCausalLM)
-    assert not isinstance(orig_model, NativeQwen2ForCausalLM)
+    assert isinstance(native_model, Qwen2Model)
+    assert not isinstance(orig_model, Qwen2Model)
 
     prompt = "Apple Silicon MLX is"
     input_ids = mx.array(tokenizer.encode(prompt))[None]
@@ -194,12 +194,12 @@ def test_cli_enable_native_models_flag():
     reason="Local Qwen 2.5 0.5B model weights not cached",
 )
 def test_simple_engine_loads_native_model():
-    """Verify SimpleEngine loads NativeQwen2ForCausalLM when enable_native_models=True."""
+    """Verify SimpleEngine loads Qwen2Model when enable_native_models=True."""
     from vllm_mlx.engine.simple import SimpleEngine
 
     engine = SimpleEngine(str(LOCAL_QWEN_PATH), enable_native_models=True)
     engine.prepare_for_start()
-    assert isinstance(engine._model.model, NativeQwen2ForCausalLM)
+    assert isinstance(engine._model.model, Qwen2Model)
 
 
 @pytest.mark.skipif(
@@ -207,10 +207,9 @@ def test_simple_engine_loads_native_model():
     reason="Local Qwen 2.5 0.5B model weights not cached",
 )
 def test_batched_engine_loads_native_model():
-    """Verify BatchedEngine loads NativeQwen2ForCausalLM when enable_native_models=True."""
+    """Verify BatchedEngine loads Qwen2Model when enable_native_models=True."""
     from vllm_mlx.engine.batched import BatchedEngine
 
     engine = BatchedEngine(str(LOCAL_QWEN_PATH), enable_native_models=True)
     engine._prepare_llm_model()
-    assert isinstance(engine._model, NativeQwen2ForCausalLM)
-
+    assert isinstance(engine._model, Qwen2Model)

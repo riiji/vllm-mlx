@@ -113,7 +113,7 @@ def _load_model_with_fallback(
         try:
             from pathlib import Path
             from mlx_lm.utils import _download, load_config, load_model, load_tokenizer
-            from ..models.native import has_native_model, get_native_model_class
+            from ..native_models import has_native_model, get_native_model_class
 
             model_path = Path(_download(model_name))
             config = load_config(model_path)
