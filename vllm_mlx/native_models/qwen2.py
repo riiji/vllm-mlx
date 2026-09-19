@@ -264,3 +264,6 @@ class Qwen2Model(nn.Module):
             get_model_classes=lambda *args, **kwargs: (cls, ModelArgs),
         )
         return model
+
+
+SUPPORTED_ARCHITECTURES: tuple[str, ...] = ("qwen2", "qwen2.5")

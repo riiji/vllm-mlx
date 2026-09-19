@@ -26,6 +26,43 @@ def test_native_model_registry():
     assert get_native_model_class("unknown") is None
 
 
+def test_native_models_no_collisions():
+    """Verify registry builds cleanly without duplicate architecture keys."""
+    from vllm_mlx.native_models import build_native_model_registry
+
+    registry = build_native_model_registry()
+    assert "qwen2" in registry
+    assert "qwen2.5" in registry
+
+    # Verify duplicate detection triggers ValueError when two modules register the same arch
+    from unittest.mock import MagicMock, patch
+
+    mock_mod = MagicMock()
+    mock_mod.name = "duplicate_qwen"
+
+    mock_imported = MagicMock()
+    mock_imported.SUPPORTED_ARCHITECTURES = ("qwen2",)
+    mock_imported.Model = Qwen2Model
+    mock_imported.ModelArgs = ModelArgs
+
+    with patch("pkgutil.iter_modules") as mock_iter:
+        qwen_mod_info = MagicMock()
+        qwen_mod_info.name = "qwen2"
+        mock_iter.return_value = [qwen_mod_info, mock_mod]
+
+        with patch("importlib.import_module") as mock_import:
+            from vllm_mlx.native_models import qwen2
+
+            def side_effect(name):
+                if "duplicate" in name:
+                    return mock_imported
+                return qwen2
+
+            mock_import.side_effect = side_effect
+            with pytest.raises(ValueError, match="Architecture collision"):
+                build_native_model_registry()
+
+
 def test_fused_qwen2_synthetic_forward():
     """Verify forward pass of Qwen2Model with synthetic weights."""
     args = ModelArgs(
