@@ -2,25 +2,60 @@
 """
 Qwen2 / Qwen2.5 implementation with fused QKV and Gate-Up projections.
 
-Projections for Query, Key, and Value are fused into a single matrix multiplication,
-and Gate and Up projections in the MLP are fused into a single matrix multiplication,
-reducing kernel dispatches during inference.
+Decode fuses QKV and gate/up matrix multiplications. Prefill uses views of the
+same weights to avoid larger live activations. SwiGLU is compiled into one
+pointwise operation with the same rounding as MLX's reference implementation.
 """
 
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.base import BaseModelArgs
-from mlx_lm.models.qwen2 import (
-    Model as UpstreamQwen2Model,
+from mlx_lm.models.base import (
+    BaseModelArgs,
     create_attention_mask,
-    initialize_rope,
     scaled_dot_product_attention,
-    swiglu,
 )
+from mlx_lm.models.rope_utils import initialize_rope
+
+
+@partial(mx.compile, shapeless=True)
+def swiglu(gate: mx.array, up: mx.array) -> mx.array:
+    """Fuse the activation while preserving MLX dtype rounding."""
+    return nn.silu(gate) * up
+
+
+def project(x: mx.array, linear: nn.Module, splits: list[int]) -> list[mx.array]:
+    """Fuse decode; use weight views in prefill to avoid larger live activations."""
+    if x.shape[-2] == 1:
+        return mx.split(linear(x), splits, axis=-1)
+    outputs = []
+    boundaries = [0, *splits, linear.weight.shape[0]]
+    for start, end in zip(boundaries, boundaries[1:]):
+        weight = linear.weight[start:end]
+        if isinstance(linear, nn.QuantizedLinear):
+            biases = linear.get("biases")
+            y = mx.quantized_matmul(
+                x,
+                weight,
+                scales=linear.scales[start:end],
+                biases=None if biases is None else biases[start:end],
+                transpose=True,
+                group_size=linear.group_size,
+                bits=linear.bits,
+                mode=linear.mode,
+            )
+            if "bias" in linear:
+                y = y + linear.bias[start:end]
+        elif "bias" in linear:
+            y = mx.addmm(linear.bias[start:end], x, weight.T)
+        else:
+            y = x @ weight.T
+        outputs.append(y)
+    return outputs
 
 
 @dataclass
@@ -38,6 +73,24 @@ class ModelArgs(BaseModelArgs):
     rope_traditional: bool = False
     rope_scaling: Optional[dict[str, Union[float, str]]] = None
     tie_word_embeddings: bool = True
+    quantization: Optional[dict[str, Any]] = None
+    quantization_config: Optional[dict[str, Any]] = None
+    quantize_activations: bool = False
+
+    def __post_init__(self):
+        # The loader quantizes fused modules using the global configuration.
+        # Reject layouts it cannot represent, so the standard loader can handle them.
+        if self.quantize_activations or (
+            self.quantization_config and not self.quantization
+        ):
+            raise ValueError(
+                "Native Qwen2 requires floating-point or MLX weight quantization"
+            )
+        unfused = (".q_proj", ".k_proj", ".v_proj", ".gate_proj", ".up_proj")
+        if any(key.endswith(unfused) for key in (self.quantization or {})):
+            raise ValueError(
+                "Native Qwen2 does not support per-projection quantization overrides"
+            )
 
 
 class FusedQwen2Attention(nn.Module):
@@ -75,8 +128,7 @@ class FusedQwen2Attention(nn.Module):
         cache: Optional[Any] = None,
     ) -> mx.array:
         B, L, _ = x.shape
-        qkv = self.qkv_proj(x)
-        queries, keys, values = mx.split(qkv, self.split_indices, axis=-1)
+        queries, keys, values = project(x, self.qkv_proj, self.split_indices)
 
         queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
         keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
@@ -101,12 +153,12 @@ class FusedQwen2MLP(nn.Module):
     def __init__(self, dim: int, hidden_dim: int):
         super().__init__()
         # Unified Gate-Up projection (1 GEMM instead of 2)
+        self.hidden_dim = hidden_dim
         self.gate_up_proj = nn.Linear(dim, 2 * hidden_dim, bias=False)
         self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
 
     def __call__(self, x: mx.array) -> mx.array:
-        gu = self.gate_up_proj(x)
-        gate, up = mx.split(gu, 2, axis=-1)
+        gate, up = project(x, self.gate_up_proj, [self.hidden_dim])
         return self.down_proj(swiglu(gate, up))
 
 
@@ -159,12 +211,10 @@ class FusedQwen2Model(nn.Module):
         else:
             h = self.embed_tokens(inputs)
 
-        mask = None
-        if h.shape[1] > 1:
-            mask = create_attention_mask(h, cache)
-
         if cache is None:
             cache = [None] * len(self.layers)
+        # Cache-specific masks also matter for single-token padded batches.
+        mask = create_attention_mask(h, cache[0])
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask=mask, cache=c)
@@ -209,34 +259,36 @@ class Qwen2Model(nn.Module):
         Transform checkpoint weights into fused QKV and Gate-Up representations.
         Supports both floating-point and quantized (scales/biases) formats.
         """
-        weights = UpstreamQwen2Model.sanitize(self, weights)
-        num_layers = getattr(self.args, "num_hidden_layers", 0)
-        return self._fuse_weights(weights, num_layers=num_layers)
+        if self.args.tie_word_embeddings:
+            weights.pop("lm_head.weight", None)
+        for key in list(weights):
+            if "self_attn.rotary_emb.inv_freq" in key:
+                del weights[key]
+        return self._fuse_weights(weights, num_layers=self.args.num_hidden_layers)
 
     @classmethod
     def _fuse_weights(
         cls, weights: dict[str, mx.array], num_layers: int
     ) -> dict[str, mx.array]:
         """Fuse separate Q, K, V and Gate, Up projections into unified tensors."""
+        groups = (
+            ("self_attn", "qkv_proj", ("q_proj", "k_proj", "v_proj")),
+            ("mlp", "gate_up_proj", ("gate_proj", "up_proj")),
+        )
         for i in range(num_layers):
-            p_attn = f"model.layers.{i}.self_attn"
-            for suffix in ("weight", "bias", "scales", "biases"):
-                q = f"{p_attn}.q_proj.{suffix}"
-                k = f"{p_attn}.k_proj.{suffix}"
-                v = f"{p_attn}.v_proj.{suffix}"
-                if q in weights and k in weights and v in weights:
-                    weights[f"{p_attn}.qkv_proj.{suffix}"] = mx.concatenate(
-                        [weights.pop(q), weights.pop(k), weights.pop(v)], axis=0
-                    )
-
-            p_mlp = f"model.layers.{i}.mlp"
-            for suffix in ("weight", "bias", "scales", "biases"):
-                g = f"{p_mlp}.gate_proj.{suffix}"
-                u = f"{p_mlp}.up_proj.{suffix}"
-                if g in weights and u in weights:
-                    weights[f"{p_mlp}.gate_up_proj.{suffix}"] = mx.concatenate(
-                        [weights.pop(g), weights.pop(u)], axis=0
-                    )
+            for module, target, sources in groups:
+                prefix = f"model.layers.{i}.{module}"
+                for suffix in ("weight", "bias", "scales", "biases"):
+                    keys = [f"{prefix}.{name}.{suffix}" for name in sources]
+                    if not all(key in weights for key in keys):
+                        continue
+                    if len({weights[key].dtype for key in keys}) != 1:
+                        raise ValueError(f"Cannot fuse different dtypes: {keys}")
+                    fused = mx.concatenate([weights.pop(key) for key in keys], axis=0)
+                    # Release source buffers per tensor instead of retaining a
+                    # second model's worth of weights in a lazy concat graph.
+                    mx.eval(fused)
+                    weights[f"{prefix}.{target}.{suffix}"] = fused
 
         return weights
 

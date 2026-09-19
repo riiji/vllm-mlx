@@ -130,10 +130,14 @@ def test_fused_qwen2_sanitize_quantized_weights():
         "model.layers.0.self_attn.q_proj.scales": mx.ones((64, 2), dtype=mx.float16),
         "model.layers.0.self_attn.q_proj.biases": mx.zeros((64, 2), dtype=mx.float16),
         "model.layers.0.self_attn.k_proj.weight": mx.zeros((32, 8), dtype=mx.uint32),
-        "model.layers.0.self_attn.k_proj.scales": mx.full((32, 2), 2.0, dtype=mx.float16),
+        "model.layers.0.self_attn.k_proj.scales": mx.full(
+            (32, 2), 2.0, dtype=mx.float16
+        ),
         "model.layers.0.self_attn.k_proj.biases": mx.zeros((32, 2), dtype=mx.float16),
         "model.layers.0.self_attn.v_proj.weight": mx.zeros((32, 8), dtype=mx.uint32),
-        "model.layers.0.self_attn.v_proj.scales": mx.full((32, 2), 3.0, dtype=mx.float16),
+        "model.layers.0.self_attn.v_proj.scales": mx.full(
+            (32, 2), 3.0, dtype=mx.float16
+        ),
         "model.layers.0.self_attn.v_proj.biases": mx.zeros((32, 2), dtype=mx.float16),
     }
     sanitized = Qwen2Model.sanitize_weights(raw_weights)
@@ -174,10 +178,9 @@ def test_qwen2_numerical_parity():
     out_orig = orig_model(input_ids)
     out_native = native_model(input_ids)
 
-    diff = mx.max(mx.abs(out_orig - out_native)).item()
-    assert diff < 1e-4, f"Max difference {diff} exceeds tolerance 1e-4"
+    # Prefill uses the same GEMM shapes and activation rounding as the reference.
+    _assert_dtype_close(out_native, out_orig, out_orig.dtype)
 
-    # Verify greedy token prediction matches
     assert int(mx.argmax(out_orig[:, -1, :], axis=-1)[0]) == int(
         mx.argmax(out_native[:, -1, :], axis=-1)[0]
     )
@@ -250,3 +253,140 @@ def test_batched_engine_loads_native_model():
     engine = BatchedEngine(str(LOCAL_QWEN_PATH), enable_native_models=True)
     engine._prepare_llm_model()
     assert isinstance(engine._model, Qwen2Model)
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+def test_swiglu_preserves_reference_rounding(dtype):
+    from mlx_lm.models.activations import swiglu as reference
+    from vllm_mlx.native_models.qwen2 import swiglu
+
+    # Include large negative gates (exp overflow) and non-contiguous inputs.
+    gate_up = mx.linspace(-100, 100, 4096).reshape(2, 4, 512).astype(dtype)
+    for x in (gate_up, gate_up[:, ::2, :]):
+        gate, up = mx.split(x, 2, axis=-1)
+        assert mx.array_equal(swiglu(gate, up), reference(gate, up)).item()
+
+
+def _assert_dtype_close(actual, expected, dtype):
+    import numpy as np
+
+    # Bound the error in units of the activation dtype's precision. Small
+    # differences from GEMM reduction order can accumulate through the model.
+    eps = {mx.float32: 2**-23, mx.float16: 2**-10, mx.bfloat16: 2**-7}[dtype]
+    assert mx.all(mx.isfinite(actual)).item()
+    assert mx.all(mx.isfinite(expected)).item()
+    np.testing.assert_allclose(
+        np.array(actual.astype(mx.float32)),
+        np.array(expected.astype(mx.float32)),
+        rtol=16 * eps,
+        atol=16 * eps,
+    )
+
+
+def _model_pair(dtype, bits=None, tied=True):
+    from mlx_lm.models.qwen2 import Model as Reference, ModelArgs as ReferenceArgs
+    from mlx.utils import tree_flatten
+    import mlx.nn as nn
+
+    config = dict(
+        model_type="qwen2",
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        vocab_size=128,
+        rms_norm_eps=1e-6,
+        tie_word_embeddings=tied,
+    )
+    mx.random.seed(17)
+    reference = Reference(ReferenceArgs(**config))
+    reference.set_dtype(dtype)
+    native = Qwen2Model(ModelArgs(**config))
+    if bits is not None:
+        nn.quantize(reference, group_size=64, bits=bits)
+        nn.quantize(native, group_size=64, bits=bits)
+    native.load_weights(
+        list(native.sanitize(dict(tree_flatten(reference.parameters()))).items())
+    )
+    mx.eval(reference.parameters(), native.parameters())
+    return reference, native
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("bits", [None, 4, 8])
+@pytest.mark.parametrize("tied", [False, True])
+def test_prefill_and_cached_decode_parity(dtype, bits, tied):
+    from mlx_lm.models.cache import KVCache
+
+    reference, native = _model_pair(dtype, bits, tied)
+    tokens = mx.array([[1, 7, 9, 20, 31, 10, 11, 8]])
+    _assert_dtype_close(native(tokens), reference(tokens), dtype)
+    caches = [[KVCache() for _ in model.layers] for model in (reference, native)]
+    for start, end in [(0, 3), (3, 6), (6, 7), (7, 8)]:
+        x = tokens[:, start:end]
+        _assert_dtype_close(
+            native(x, cache=caches[1]), reference(x, cache=caches[0]), dtype
+        )
+    # Fusion must not duplicate parameters or change their storage size.
+    from mlx.utils import tree_flatten
+
+    sizes = [
+        sum(x.nbytes for _, x in tree_flatten(m.parameters()))
+        for m in (reference, native)
+    ]
+    assert sizes[0] == sizes[1]
+
+
+@pytest.mark.parametrize("kind", ["padded", "rotating", "quantized"])
+def test_cache_specific_attention_masks(kind):
+    from mlx_lm.models.cache import BatchKVCache, RotatingKVCache, QuantizedKVCache
+
+    reference, native = _model_pair(mx.float32)
+    factories = {
+        "padded": lambda: BatchKVCache(left_padding=[0, 2]),
+        "rotating": lambda: RotatingKVCache(max_size=4),
+        "quantized": lambda: QuantizedKVCache(group_size=32, bits=8),
+    }
+    caches = [
+        [factories[kind]() for _ in model.layers] for model in (reference, native)
+    ]
+    tokens = mx.array([[1, 2, 3, 4, 5, 6, 7, 8], [0, 0, 3, 4, 5, 6, 7, 8]])
+    for start, end in [(0, 3), (3, 5), (5, 6), (6, 7), (7, 8)]:
+        x = tokens[:, start:end]
+        _assert_dtype_close(
+            native(x, cache=caches[1]), reference(x, cache=caches[0]), mx.float32
+        )
+
+
+def test_quantization_overrides_rejected_before_fusing():
+    args = dict(
+        model_type="qwen2",
+        hidden_size=64,
+        num_hidden_layers=1,
+        intermediate_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        rms_norm_eps=1e-6,
+        vocab_size=64,
+    )
+    with pytest.raises(ValueError, match="per-projection"):
+        ModelArgs(
+            **args,
+            quantization={
+                "bits": 4,
+                "group_size": 64,
+                "model.layers.0.self_attn.q_proj": {"bits": 8, "group_size": 64},
+            },
+        )
+    with pytest.raises(ValueError, match="MLX weight quantization"):
+        ModelArgs(**args, quantization_config={"quant_method": "awq"})
+
+
+def test_fusion_does_not_promote_weight_dtype():
+    weights = {
+        f"model.layers.0.self_attn.{name}_proj.weight": mx.ones((64, 64), dtype)
+        for name, dtype in zip(("q", "k", "v"), (mx.float16, mx.float32, mx.float16))
+    }
+    with pytest.raises(ValueError, match="different dtypes"):
+        Qwen2Model.sanitize_weights(weights)
