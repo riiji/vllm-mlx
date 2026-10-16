@@ -2904,6 +2904,37 @@ class TestSimpleEngineConcurrency:
             assert produced < total
 
     @pytest.mark.anyio
+    async def test_chat_returns_generated_token_ids(self, mock_llm_model):
+        """Non-streaming chat keeps the generated token IDs, EOS included."""
+        from vllm_mlx.engine.simple import SimpleEngine
+        from vllm_mlx.models.llm import StreamingOutput
+
+        # Qwen2.5 IDs for "Hello", " World", "." and <|im_end|>; a natural
+        # stop ends the stream without a finish_reason on the last chunk.
+        generated = [(9707, "Hello"), (4337, " World"), (13, "."), (151645, "")]
+
+        def stream_generate_side_effect(**kwargs):
+            for token, text in generated:
+                yield StreamingOutput(text=text, token=token, prompt_tokens=3)
+
+        mock_llm_model.stream_generate = MagicMock(
+            side_effect=stream_generate_side_effect
+        )
+
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine("test-model")
+            engine._model = mock_llm_model
+            engine._loaded = True
+
+            output = await engine.chat(
+                messages=[{"role": "user", "content": "Say hello."}], max_tokens=20
+            )
+
+        assert output.text == "Hello World."
+        assert output.tokens == [9707, 4337, 13, 151645]
+        assert output.completion_tokens == len(output.tokens)
+
+    @pytest.mark.anyio
     async def test_specprefill_path_does_not_prelock_serialized_runner(self):
         """SpecPrefill should let _run_blocking_serialized own the lock."""
         from vllm_mlx.engine.simple import SimpleEngine

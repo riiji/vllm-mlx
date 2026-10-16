@@ -1455,6 +1455,7 @@ class SimpleEngine(BaseEngine):
             async with self._generation_worker_in_use():
                 try:
                     accumulated_text = ""
+                    token_ids: list[int] = []
                     prompt_tokens = 0
                     completion_tokens = 0
                     finished = False
@@ -1496,6 +1497,8 @@ class SimpleEngine(BaseEngine):
                             )
                         new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
                         accumulated_text += new_text
+                        if getattr(chunk, "token", None) is not None:
+                            token_ids.append(chunk.token)
 
                         finished = (
                             getattr(chunk, "finished", False)
@@ -1511,9 +1514,12 @@ class SimpleEngine(BaseEngine):
                                     else "stop"
                                 )
 
+                        # Only the final chunk carries the token IDs, so the
+                        # list is copied once rather than on every token.
                         yield GenerationOutput(
                             text=accumulated_text,
                             new_text=new_text,
+                            tokens=list(token_ids) if finished else [],
                             prompt_tokens=prompt_tokens,
                             completion_tokens=completion_tokens,
                             finished=finished,
@@ -1537,6 +1543,7 @@ class SimpleEngine(BaseEngine):
                         yield GenerationOutput(
                             text=accumulated_text,
                             new_text="",
+                            tokens=list(token_ids),
                             prompt_tokens=prompt_tokens,
                             completion_tokens=completion_tokens,
                             finished=True,
@@ -2282,6 +2289,7 @@ class SimpleEngine(BaseEngine):
             producer_task = asyncio.create_task(_produce_responses())
 
             accumulated_text = ""
+            token_ids: list[int] = []
             token_count = 0
             finished = False
             cache_path_failed_before_first_token = False
@@ -2307,6 +2315,8 @@ class SimpleEngine(BaseEngine):
                     token_count += 1
                     new_text = resp.text if hasattr(resp, "text") else str(resp)
                     accumulated_text += new_text
+                    if getattr(resp, "token", None) is not None:
+                        token_ids.append(resp.token)
                     finish_reason = getattr(resp, "finish_reason", None)
                     finished = finish_reason is not None or token_count >= max_tokens
                     if finish_reason is None and finished:
@@ -2315,6 +2325,7 @@ class SimpleEngine(BaseEngine):
                     yield GenerationOutput(
                         text=accumulated_text,
                         new_text=new_text,
+                        tokens=list(token_ids) if finished else [],
                         prompt_tokens=full_token_count,
                         completion_tokens=token_count,
                         finished=finished,
