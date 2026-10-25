@@ -2935,6 +2935,75 @@ class TestSimpleEngineConcurrency:
         assert output.completion_tokens == len(output.tokens)
 
     @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("media_part", "native_video", "chunks", "expected"),
+        [
+            (
+                {"type": "image_url", "image_url": {"url": "image.png"}},
+                False,
+                [
+                    ("Red", None, 1),
+                    (" square", None, 2),
+                    (".", None, 3),
+                    ("", "stop", 3),
+                ],
+                3,
+            ),
+            (
+                {"type": "audio_url", "audio_url": {"url": "audio.wav"}},
+                False,
+                [("Hello", None, 1), (" there", None, 2), ("", "stop", 2)],
+                2,
+            ),
+            (
+                {"type": "video_url", "video_url": {"url": "video.mp4"}},
+                True,
+                [("a cat walks by", "stop", 7)],
+                7,
+            ),
+        ],
+        ids=["image", "audio", "native-video"],
+    )
+    async def test_mllm_media_chat_reports_model_completion_tokens(
+        self, media_part, native_video, chunks, expected
+    ):
+        """Non-streaming media chat keeps the model's completion-token count."""
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        class FakeMllmModel:
+            _video_native = native_video
+
+            def _collect_video_inputs(self, _messages):
+                return {0: ["video.mp4"]} if native_video else {}
+
+            def stream_chat(self, **_kwargs):
+                for text, finish_reason, completion_tokens in chunks:
+                    yield SimpleNamespace(
+                        text=text,
+                        finish_reason=finish_reason,
+                        prompt_tokens=5,
+                        completion_tokens=completion_tokens,
+                    )
+
+        engine = SimpleEngine("test-model", force_mllm=True, mtp=False)
+        engine._loaded = True
+        engine._text_model = MagicMock()
+        engine._model = FakeMllmModel()
+
+        output = await engine.chat(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [media_part, {"type": "text", "text": "describe"}],
+                }
+            ],
+            max_tokens=50,
+        )
+
+        assert output.text == "".join(text for text, _, _ in chunks)
+        assert output.completion_tokens == expected
+
+    @pytest.mark.anyio
     async def test_specprefill_path_does_not_prelock_serialized_runner(self):
         """SpecPrefill should let _run_blocking_serialized own the lock."""
         from vllm_mlx.engine.simple import SimpleEngine

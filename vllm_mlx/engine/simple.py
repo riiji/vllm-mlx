@@ -134,6 +134,13 @@ def _processors_retired(processors: list[Any] | None) -> bool:
     )
 
 
+def _mllm_chunk_completion_tokens(chunk: object, chunk_count: int) -> int:
+    reported = getattr(chunk, "completion_tokens", None)
+    if type(reported) is int:
+        return reported
+    return chunk_count
+
+
 # Sentinel for "the generation iterator is exhausted", pulled across the
 # worker-thread boundary where StopIteration cannot travel.
 _STREAM_DONE = object()
@@ -1751,6 +1758,7 @@ class SimpleEngine(BaseEngine):
             # (e.g. OpenCode sends title + main request simultaneously).
             accumulated_text = ""
             token_count = 0
+            completion_tokens = 0
             request_id = str(kwargs.pop("request_id", "") or f"simple-{id(messages):x}")
             native_video_request = bool(
                 getattr(self._model, "_video_native", False) is True
@@ -1798,7 +1806,7 @@ class SimpleEngine(BaseEngine):
                                     text=accumulated_text,
                                     new_text="",
                                     prompt_tokens=0,
-                                    completion_tokens=token_count,
+                                    completion_tokens=completion_tokens,
                                     finished=True,
                                     finish_reason="abort",
                                 )
@@ -1810,6 +1818,9 @@ class SimpleEngine(BaseEngine):
                                 break
 
                             token_count += 1
+                            completion_tokens = _mllm_chunk_completion_tokens(
+                                chunk, token_count
+                            )
                             new_text = (
                                 chunk.text if hasattr(chunk, "text") else str(chunk)
                             )
@@ -1821,7 +1832,7 @@ class SimpleEngine(BaseEngine):
                                 text=accumulated_text,
                                 new_text=new_text,
                                 prompt_tokens=getattr(chunk, "prompt_tokens", 0),
-                                completion_tokens=token_count,
+                                completion_tokens=completion_tokens,
                                 finished=finished,
                                 finish_reason=(
                                     chunk.finish_reason if finished else None
@@ -1866,6 +1877,7 @@ class SimpleEngine(BaseEngine):
             )
             for chunk in chunks:
                 token_count += 1
+                completion_tokens = _mllm_chunk_completion_tokens(chunk, token_count)
                 new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
                 accumulated_text += new_text
                 finished = chunk.finish_reason is not None
@@ -1873,7 +1885,7 @@ class SimpleEngine(BaseEngine):
                     text=accumulated_text,
                     new_text=new_text,
                     prompt_tokens=getattr(chunk, "prompt_tokens", 0),
-                    completion_tokens=token_count,
+                    completion_tokens=completion_tokens,
                     finished=finished,
                     finish_reason=chunk.finish_reason if finished else None,
                     mtp_drafts=getattr(chunk, "mtp_drafts", 0),
